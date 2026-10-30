@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+    数据日志 Mapper XML（双表方案）
+    热表 data_log_hot + 冷表 data_log_cold，查询时两张表都查，合并结果。
+    两张表都按 create_ts 分区，查询时自动分区裁剪。
+
+    @Author lhh
+    Create 2026/10/26 20:00
+-->
+<mapper namespace="com.lhh.mapper.DataLogMapper">
+
+    <!-- ==================== 热表写入 ==================== -->
+
+    <!-- 插入热表：回写自增主键 id；create_ts 为分区键，落入对应日期分区 -->
+    <insert id="insertHot" parameterType="com.lhh.pojo.DataLog"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO data_log_hot (create_ts, content)
+        VALUES (#{createTs}, #{content})
+    </insert>
+
+    <!-- ==================== 热表查询 ==================== -->
+
+    <select id="selectHotByDateRange" resultType="com.lhh.pojo.DataLog">
+        SELECT id, create_ts, content
+        FROM data_log_hot
+        WHERE create_ts &gt;= #{start} AND create_ts &lt;= #{end}
+        ORDER BY create_ts DESC
+    </select>
+
+    <select id="selectHotById" resultType="com.lhh.pojo.DataLog">
+        SELECT id, create_ts, content
+        FROM data_log_hot
+        WHERE id = #{id}
+    </select>
+
+    <!-- ==================== 冷表查询 ==================== -->
+
+    <select id="selectColdByDateRange" resultType="com.lhh.pojo.DataLog">
+        SELECT id, create_ts, content
+        FROM data_log_cold
+        WHERE create_ts &gt;= #{start} AND create_ts &lt;= #{end}
+        ORDER BY create_ts DESC
+    </select>
+
+    <select id="selectColdById" resultType="com.lhh.pojo.DataLog">
+        SELECT id, create_ts, content
+        FROM data_log_cold
+        WHERE id = #{id}
+    </select>
+</mapper>

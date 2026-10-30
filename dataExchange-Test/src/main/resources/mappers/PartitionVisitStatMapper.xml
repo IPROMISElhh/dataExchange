@@ -1,0 +1,102 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+    分区访问统计 Mapper XML（双表方案）
+    热表 data_log_hot + 冷表 data_log_cold，迁移通过 INSERT SELECT + DELETE 行级搬迁实现。
+    兼容 MySQL 和 OceanBase（MySQL 租户）。
+
+    @Author lhh
+    Create 2026/10/26 15:57
+-->
+<mapper namespace="com.lhh.mapper.PartitionVisitMapper">
+
+    <!-- ==================== 访问统计 ==================== -->
+
+    <update id="markVisit">
+        INSERT INTO partition_visit_stat(table_name, partition_name, visit_count)
+        VALUES (#{tableName}, #{partitionName}, 1)
+        ON DUPLICATE KEY UPDATE visit_count = visit_count + 1
+    </update>
+
+    <!--
+        迁移后登记：记录目标表该分区的迁移时间并清零访问量。
+        用 upsert 保证目标表原本没有统计记录时也能创建，冷却期才能跨表生效。
+    -->
+    <update id="updateLastMovedTime">
+        INSERT INTO partition_visit_stat(table_name, partition_name, visit_count, last_moved_time)
+        VALUES (#{tableName}, #{partitionName}, 0, NOW())
+        ON DUPLICATE KEY UPDATE visit_count = 0, last_moved_time = NOW()
+    </update>
+
+    <update id="resetAllVisitCount">
+        UPDATE partition_visit_stat SET visit_count = 0
+    </update>
+
+    <select id="getStat" resultType="com.lhh.pojo.PartitionVisitStat">
+        SELECT * FROM partition_visit_stat
+        WHERE table_name = #{tableName} AND partition_name = #{partitionName}
+    </select>
+
+    <!-- ==================== 分区信息查询 ==================== -->
+
+    <!--
+        查询指定表的所有分区（排除兜底分区）
+        兼容 MySQL 和 OceanBase：使用 INFORMATION_SCHEMA.PARTITIONS
+    -->
+    <select id="listAllTablePartition" resultType="java.util.Map">
+        SELECT PARTITION_NAME as partition_name
+        FROM INFORMATION_SCHEMA.PARTITIONS
+        WHERE TABLE_NAME = #{tableName} AND TABLE_SCHEMA = DATABASE()
+          AND PARTITION_NAME IS NOT NULL
+          AND PARTITION_NAME NOT IN ('p_future', 'p_cold_init')
+    </select>
+
+    <select id="countPartition" resultType="int">
+        SELECT COUNT(*) FROM INFORMATION_SCHEMA.PARTITIONS
+        WHERE TABLE_NAME = #{tableName} AND PARTITION_NAME = #{partitionName}
+          AND TABLE_SCHEMA = DATABASE()
+    </select>
+
+    <!-- 统计指定分区行数，冷热调度用于跳过空（镜像）分区 -->
+    <select id="countRowsInPartition" resultType="int">
+        SELECT COUNT(*) FROM ${tableName} PARTITION (${partitionName})
+    </select>
+
+    <!-- ==================== 双表迁移操作（行级搬迁）==================== -->
+
+    <!--
+        热→冷：把热表指定分区的数据复制到冷表（目标分区已存在且应为空）。
+        用 INSERT IGNORE 防止上次残留导致主键冲突，配合事务可自愈。
+    -->
+    <insert id="copyHotToCold">
+        INSERT IGNORE INTO ${coldTableName}
+        SELECT * FROM ${hotTableName} PARTITION (${partitionName})
+    </insert>
+
+    <!--
+        冷→热：把冷表指定分区的数据复制到热表。
+    -->
+    <insert id="copyColdToHot">
+        INSERT IGNORE INTO ${hotTableName}
+        SELECT * FROM ${coldTableName} PARTITION (${partitionName})
+    </insert>
+
+    <!--
+        删除源表指定分区内的行数据，保留空分区（不 DROP PARTITION，保证两表分区布局长期对称）。
+    -->
+    <delete id="deleteRowsFromPartition">
+        DELETE FROM ${tableName} PARTITION (${partitionName})
+    </delete>
+
+    <!--
+        为指定表新增一个日分区，仅用于每日向前补齐（两表同步），必须按日期递增调用。
+        lessThanDate = 分区日期 + 1 天。
+    -->
+    <update id="addPartition">
+        ALTER TABLE ${tableName} ADD PARTITION (
+            PARTITION ${partitionName} VALUES LESS THAN (TO_DAYS(#{lessThanDate}))
+        )
+    </update>
+</mapper>
