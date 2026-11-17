@@ -6,9 +6,9 @@ spring:
     type: com.alibaba.druid.pool.DruidDataSource
     # Druid的其他属性配置 springboot3整合情况下,数据库连接信息必须在Druid属性下!
     druid:
-      url: jdbc:mysql://localhost:13306/ex_test
-      username: root
-      password: 991213Lhh.23
+      url: jdbc:mysql://
+      username:
+      password:
       driver-class-name: com.mysql.cj.jdbc.Driver
 
 # ============================================
