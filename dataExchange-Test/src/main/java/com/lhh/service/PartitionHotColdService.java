@@ -68,27 +68,47 @@ public class PartitionHotColdService {
     public void ensureFuturePartitions() {
         int horizon = hotColdConfig.getHorizonDays() == null ? 7 : hotColdConfig.getHorizonDays();
         LocalDate today = LocalDate.now();
-        String[] tables = {hotColdConfig.getTableName(), hotColdConfig.getColdTableName()};
+//        String[] tables = {hotColdConfig.getTableName(), hotColdConfig.getColdTableName()};
+        List<HotColdConfig.TablePair> tables = hotColdConfig.getTables();
 
-        for (String tableName : tables) {
+        for (HotColdConfig.TablePair tablePair : tables) {
             // 按日期升序遍历，保证新分区边界递增，ADD PARTITION 合法
             for (int i = 0; i < horizon; i++) {
                 LocalDate date = today.plusDays(i);
                 String partName = PARTITION_PREFIX + date.format(PARTITION_DATE_FMT);
 
-                if (partitionVisitMapper.countPartition(tableName, partName) > 0) {
+                if (partitionVisitMapper.countPartition(tablePair.getHotTableName(), partName) > 0) {
                     continue;
                 }
 
                 Map<String, Object> param = new HashMap<>();
-                param.put("tableName", tableName);
+                param.put("tableName", tablePair.getHotTableName());
                 param.put("partitionName", partName);
                 param.put("lessThanDate", date.plusDays(1).format(LESS_THAN_FMT));
                 try {
                     partitionVisitMapper.addPartition(param);
-                    log.info("表 {} 自动补齐分区: {} (LESS THAN {})", tableName, partName, date.plusDays(1));
+                    log.info("表 {} 自动补齐分区: {} (LESS THAN {})", tablePair.getHotTableName(), partName, date.plusDays(1));
                 } catch (Exception e) {
-                    log.error("表 {} 补齐分区 {} 失败", tableName, partName, e);
+                    log.error("表 {} 补齐分区 {} 失败", tablePair.getHotTableName(), partName, e);
+                }
+            }
+            for (int i = 0; i < horizon; i++) {
+                LocalDate date = today.plusDays(i);
+                String partName = PARTITION_PREFIX + date.format(PARTITION_DATE_FMT);
+
+                if (partitionVisitMapper.countPartition(tablePair.getColdTableName(), partName) > 0) {
+                    continue;
+                }
+
+                Map<String, Object> param = new HashMap<>();
+                param.put("tableName", tablePair.getColdTableName());
+                param.put("partitionName", partName);
+                param.put("lessThanDate", date.plusDays(1).format(LESS_THAN_FMT));
+                try {
+                    partitionVisitMapper.addPartition(param);
+                    log.info("表 {} 自动补齐分区: {} (LESS THAN {})", tablePair.getColdTableName(), partName, date.plusDays(1));
+                } catch (Exception e) {
+                    log.error("表 {} 补齐分区 {} 失败", tablePair.getColdTableName(), partName, e);
                 }
             }
         }
@@ -123,79 +143,87 @@ public class PartitionHotColdService {
         // ① 两表对称补齐未来分区
         ensureFuturePartitions();
 
-        String hotTable = hotColdConfig.getTableName();
-        String coldTable = hotColdConfig.getColdTableName();
+//        String hotTable = hotColdConfig.getTableName();
+//        String coldTable = hotColdConfig.getColdTableName();
+
+        List<HotColdConfig.TablePair> tables = hotColdConfig.getTables();
         // 今天分区名：今天及以后的分区持续有写入/尚无历史数据，不参与迁冷
         String todayPart = PARTITION_PREFIX + LocalDate.now().format(PARTITION_DATE_FMT);
 
-        // ② 扫描热表分区，挑出冷分区迁到冷表
-        List<Map<String, Object>> hotPartitions = partitionVisitMapper.listAllTablePartition(hotTable);
-        for (Map<String, Object> row : hotPartitions) {
-            Object partNameObj = row.get("partition_name");
-            if (partNameObj == null) {
-                log.warn("热表发现 partition_name 为空的记录，跳过");
-                continue;
-            }
-            String partName = partNameObj.toString();
-            // 只降级"过去"的分区（分区名定宽 pYYYYMMDD，字符串比较等价于日期比较）
-            if (partName.compareTo(todayPart) >= 0) {
-                continue;
-            }
-            // 空分区（数据已在冷表的镜像分区）直接跳过，避免反复迁冷并误清冷表统计
-            if (partitionVisitMapper.countRowsInPartition(hotTable, partName) == 0) {
-                continue;
+        for (HotColdConfig.TablePair tablePair : tables){
+            String hotTable = tablePair.getHotTableName();
+            String coldTable = tablePair.getColdTableName();
+            // ② 扫描热表分区，挑出冷分区迁到冷表
+            List<Map<String, Object>> hotPartitions = partitionVisitMapper.listAllTablePartition(hotTable);
+            for (Map<String, Object> row : hotPartitions) {
+                Object partNameObj = row.get("partition_name");
+                if (partNameObj == null) {
+                    log.warn("热表发现 partition_name 为空的记录，跳过");
+                    continue;
+                }
+                String partName = partNameObj.toString();
+                // 只降级"过去"的分区（分区名定宽 pYYYYMMDD，字符串比较等价于日期比较）
+                if (partName.compareTo(todayPart) >= 0) {
+                    continue;
+                }
+                // 空分区（数据已在冷表的镜像分区）直接跳过，避免反复迁冷并误清冷表统计
+                if (partitionVisitMapper.countRowsInPartition(hotTable, partName) == 0) {
+                    continue;
+                }
+
+                PartitionVisitStat stat = partitionVisitMapper.getStat(hotTable, partName);
+                // 访问量按 (表, 分区) 双键统计，热表/冷表同一分区各自独立计数
+                long visitCount = (stat != null) ? stat.getVisitCount() : 0L;
+
+                // 冷却期检查（迁到冷表后登记的是冷表统计，热表扫描不受冷却限制，反之同理）
+                if (isInCoolDown(stat)) {
+                    log.debug("热表分区 {} 处于冷却期(上次迁移: {})，跳过本轮判定", partName, stat.getLastMovedTime());
+                    continue;
+                }
+
+                // 冷分区判定：访问量 <= 冷阈值 → 迁到冷表
+                if (visitCount <= hotColdConfig.getColdThreshold()) {
+                    partitionMigrationService.moveToCold(hotTable,coldTable,partName);
+                }
+
             }
 
-            PartitionVisitStat stat = partitionVisitMapper.getStat(hotTable, partName);
-            // 访问量按 (表, 分区) 双键统计，热表/冷表同一分区各自独立计数
-            long visitCount = (stat != null) ? stat.getVisitCount() : 0L;
+            // ③ 扫描冷表分区，挑出热分区迁回热表
+            List<Map<String, Object>> coldPartitions = partitionVisitMapper.listAllTablePartition(coldTable);
+            for (Map<String, Object> row : coldPartitions) {
+                Object partNameObj = row.get("partition_name");
+                if (partNameObj == null) {
+                    log.warn("冷表发现 partition_name 为空的记录，跳过");
+                    continue;
+                }
+                String partName = partNameObj.toString();
 
-            // 冷却期检查（迁到冷表后登记的是冷表统计，热表扫描不受冷却限制，反之同理）
-            if (isInCoolDown(stat)) {
-                log.debug("热表分区 {} 处于冷却期(上次迁移: {})，跳过本轮判定", partName, stat.getLastMovedTime());
-                continue;
+                // 空分区（数据已迁回热表的镜像分区，或尚未使用的未来分区）直接跳过
+                if (partitionVisitMapper.countRowsInPartition(coldTable, partName) == 0) {
+                    continue;
+                }
+
+                // 读冷表维度的统计记录（与热表扫描按表各自独立计数）
+                PartitionVisitStat stat = partitionVisitMapper.getStat(coldTable, partName);
+                long visitCount = (stat != null) ? stat.getVisitCount() : 0L;
+
+                if (isInCoolDown(stat)) {
+                    log.info("冷表分区 {} 处于冷却期(上次迁移: {})，跳过本轮判定", partName, stat.getLastMovedTime());
+                    continue;
+                }
+
+                // 热分区判定：访问量 >= 热阈值 → 迁回热表
+                if (visitCount >= hotColdConfig.getHotThreshold()) {
+                    partitionMigrationService.moveToHot(hotTable,coldTable,partName);
+                }
             }
 
-            // 冷分区判定：访问量 <= 冷阈值 → 迁到冷表
-            if (visitCount <= hotColdConfig.getColdThreshold()) {
-                partitionMigrationService.moveToCold(partName);
-            }
 
         }
-
-        // ③ 扫描冷表分区，挑出热分区迁回热表
-        List<Map<String, Object>> coldPartitions = partitionVisitMapper.listAllTablePartition(coldTable);
-        for (Map<String, Object> row : coldPartitions) {
-            Object partNameObj = row.get("partition_name");
-            if (partNameObj == null) {
-                log.warn("冷表发现 partition_name 为空的记录，跳过");
-                continue;
-            }
-            String partName = partNameObj.toString();
-
-            // 空分区（数据已迁回热表的镜像分区，或尚未使用的未来分区）直接跳过
-            if (partitionVisitMapper.countRowsInPartition(coldTable, partName) == 0) {
-                continue;
-            }
-
-            // 读冷表维度的统计记录（与热表扫描按表各自独立计数）
-            PartitionVisitStat stat = partitionVisitMapper.getStat(coldTable, partName);
-            long visitCount = (stat != null) ? stat.getVisitCount() : 0L;
-
-            if (isInCoolDown(stat)) {
-                log.info("冷表分区 {} 处于冷却期(上次迁移: {})，跳过本轮判定", partName, stat.getLastMovedTime());
-                continue;
-            }
-
-            // 热分区判定：访问量 >= 热阈值 → 迁回热表
-            if (visitCount >= hotColdConfig.getHotThreshold()) {
-                partitionMigrationService.moveToHot(partName);
-            }
-        }
-
         // ④ 本轮全部分区判定/迁移结束后，统一将 visit_count 归零（不动 last_moved_time，保留冷却期）
         partitionVisitMapper.resetAllVisitCount();
 
         log.info("本轮冷热调度完成（双表行级搬迁）");
+
     }
 }

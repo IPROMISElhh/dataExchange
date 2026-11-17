@@ -6,9 +6,9 @@ spring:
     type: com.alibaba.druid.pool.DruidDataSource
     # Druid的其他属性配置 springboot3整合情况下,数据库连接信息必须在Druid属性下!
     druid:
-      url: jdbc:mysql://
-      username:
-      password:
+      url: jdbc:mysql://localhost:13306/ex_test
+      username: root
+      password: 991213Lhh.23
       driver-class-name: com.mysql.cj.jdbc.Driver
 
 # ============================================
@@ -33,20 +33,27 @@ mqtt:
   connection-timeout: 10
 
 # ============================================
-# 冷热分离业务配置
+# 冷热分离业务配置（三张业务表：碎石桩 / 防渗墙 / 固结）
 # ============================================
 hotcold:
-  # 热数据表名（按天分区，存近期高频数据）
-  table-name: data_log_hot
-  # 冷数据表名（按天分区，存历史低频数据）
-  cold-table-name: data_log_cold
+  # 参与冷热调度的表清单：每项为一对「热表 + 冷表」，两表须保持对称分区布局
+  tables:
+    # 碎石桩（type=0）
+    - hot-table-name: crushed_stone_pile_hot
+      cold-table-name: crushed_stone_pile_cold
+    # 防渗墙（type=1）
+    - hot-table-name: anti_seepage_wall_hot
+      cold-table-name: anti_seepage_wall_cold
+    # 固结（type=2）
+    - hot-table-name: consolidation_hot
+      cold-table-name: consolidation_cold
   # 热阈值：本周期访问量 >= 该值 → 判定为热分区
   hot-threshold: 2
   # 冷阈值：本周期访问量 <= 该值 → 判定为冷分区，迁移到冷表
   cold-threshold: 1
   # 冷却时间（秒）：分区迁移后至少等待该时长才允许再次迁移
   cool-down-seconds: 10
-  # 分区预建前瞻天数：每日为热表和冷表向前补齐 [今天, 今天+horizon) 的日分区（两表对称）
+  # 分区预建前瞻天数：每日为每张表的热表和冷表向前补齐 [今天, 今天+horizon) 的日分区（两表对称）
   horizon-days: 7
 
 # ============================================

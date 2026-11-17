@@ -3,6 +3,7 @@ package com.lhh.mapper;
 import com.lhh.pojo.PartitionVisitStat;
 import org.apache.ibatis.annotations.Param;
 
+import java.time.LocalDateTime;
 import java.util.List;
 import java.util.Map;
 
@@ -47,6 +48,20 @@ public interface PartitionVisitMapper {
      * 从 INFORMATION_SCHEMA.PARTITIONS 获取，排除 p_future 和 p_cold_init。
      */
     List<Map<String,Object>> listAllTablePartition(String tableName);
+
+    /**
+     * 解析某个数据时间实际落入的分区名。
+     * <p>
+     * RANGE 分区首个分区无下界，早于其边界的历史数据会落入首个分区，
+     * 故不能简单按日期格式化推分区名，需按真实分区上界定位：
+     * 取第一个「上界(PARTITION_DESCRIPTION 的 TO_DAYS 值) &gt; TO_DAYS(dataTime)」的分区即为数据实际所在分区。
+     * </p>
+     *
+     * @param tableName 业务表名
+     * @param dataTime  数据时间（分区键取值）
+     * @return 实际分区名；若 dataTime 超出所有分区上界（无分区可容纳）返回 null
+     */
+    String resolvePartitionByTime(@Param("tableName") String tableName, @Param("dataTime") LocalDateTime dataTime);
 
     /** 检查指定分区是否已存在 */
     int countPartition(@Param("tableName") String tableName, @Param("partitionName") String partitionName);

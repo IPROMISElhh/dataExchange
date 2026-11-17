@@ -15,7 +15,7 @@
     <!-- ==================== 访问统计 ==================== -->
 
     <update id="markVisit">
-        INSERT INTO partition_visit_stat(table_name, partition_name, visit_count)
+        INSERT INTO partition_visit_stat_business(table_name, partition_name, visit_count)
         VALUES (#{tableName}, #{partitionName}, 1)
         ON DUPLICATE KEY UPDATE visit_count = visit_count + 1
     </update>
@@ -25,17 +25,17 @@
         用 upsert 保证目标表原本没有统计记录时也能创建，冷却期才能跨表生效。
     -->
     <update id="updateLastMovedTime">
-        INSERT INTO partition_visit_stat(table_name, partition_name, visit_count, last_moved_time)
+        INSERT INTO partition_visit_stat_business(table_name, partition_name, visit_count, last_moved_time)
         VALUES (#{tableName}, #{partitionName}, 0, NOW())
         ON DUPLICATE KEY UPDATE visit_count = 0, last_moved_time = NOW()
     </update>
 
     <update id="resetAllVisitCount">
-        UPDATE partition_visit_stat SET visit_count = 0
+        UPDATE partition_visit_stat_business SET visit_count = 0
     </update>
 
     <select id="getStat" resultType="com.lhh.pojo.PartitionVisitStat">
-        SELECT * FROM partition_visit_stat
+        SELECT * FROM partition_visit_stat_business
         WHERE table_name = #{tableName} AND partition_name = #{partitionName}
     </select>
 
@@ -51,6 +51,24 @@
         WHERE TABLE_NAME = #{tableName} AND TABLE_SCHEMA = DATABASE()
           AND PARTITION_NAME IS NOT NULL
           AND PARTITION_NAME NOT IN ('p_future', 'p_cold_init')
+    </select>
+
+    <!--
+        解析数据时间实际落入的分区名。
+        PARTITION_DESCRIPTION 存的是 RANGE 上界的 TO_DAYS 值；
+        取第一个「上界 > TO_DAYS(dataTime)」的分区（按分区顺序）即数据真实所在分区。
+        首个分区无下界，故早于窗口起始的历史数据会正确归入首个分区（如 2026-08-13 → p20261116）。
+        超出所有分区上界时无匹配，返回空（此类数据本就无法插入）。
+    -->
+    <select id="resolvePartitionByTime" resultType="string">
+        SELECT PARTITION_NAME
+        FROM INFORMATION_SCHEMA.PARTITIONS
+        WHERE TABLE_NAME = #{tableName} AND TABLE_SCHEMA = DATABASE()
+          AND PARTITION_NAME IS NOT NULL
+          AND PARTITION_DESCRIPTION &lt;&gt; 'MAXVALUE'
+          AND CAST(PARTITION_DESCRIPTION AS UNSIGNED) &gt; TO_DAYS(#{dataTime})
+        ORDER BY PARTITION_ORDINAL_POSITION
+        LIMIT 1
     </select>
 
     <select id="countPartition" resultType="int">

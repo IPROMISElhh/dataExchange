@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<!--
+    碎石桩数据 Mapper XML（双表方案，type=0）
+    热表 crushed_stone_pile_hot + 冷表 crushed_stone_pile_cold，查询时两张表都查，合并结果。
+    两张表都按 collect_time 分区，查询时自动分区裁剪。
+    插入使用 INSERT IGNORE，借助唯一键 device_id + seq + collect_time 判重（兼容 QoS 1 重复投递）。
+
+    @Author lhh
+    Create 2026/11/16
+-->
+<mapper namespace="com.lhh.mapper.CrushedStonePileMapper">
+
+    <!-- ==================== 热表写入 ==================== -->
+
+    <!-- 插入热表：回写自增主键 id；collect_time 为分区键，落入对应日期分区；重复数据由唯一键忽略 -->
+    <insert id="insertHot" parameterType="com.lhh.pojo.CrushedStonePile"
+            useGeneratedKeys="true" keyProperty="id">
+        INSERT IGNORE INTO crushed_stone_pile_hot
+            (device_id, collect_time, seq, run_depth, run_current, run_water_press,
+             run_weight_add, run_state, type, create_ts)
+        VALUES
+            (#{deviceId}, #{collectTime}, #{seq}, #{runDepth}, #{runCurrent}, #{runWaterPress},
+             #{runWeightAdd}, #{runState}, #{type}, #{createTs})
+    </insert>
+
+    <!-- ==================== 热表查询 ==================== -->
+
+    <select id="selectHotByDateRange" resultType="com.lhh.pojo.CrushedStonePile">
+        SELECT id, device_id, collect_time, seq, run_depth, run_current, run_water_press,
+               run_weight_add, run_state, type, create_ts
+        FROM crushed_stone_pile_hot
+        WHERE collect_time &gt;= #{start} AND collect_time &lt;= #{end}
+        ORDER BY collect_time DESC
+    </select>
+
+    <select id="selectHotById" resultType="com.lhh.pojo.CrushedStonePile">
+        SELECT id, device_id, collect_time, seq, run_depth, run_current, run_water_press,
+               run_weight_add, run_state, type, create_ts
+        FROM crushed_stone_pile_hot
+        WHERE id = #{id}
+    </select>
+
+    <!-- ==================== 冷表查询 ==================== -->
+
+    <select id="selectColdByDateRange" resultType="com.lhh.pojo.CrushedStonePile">
+        SELECT id, device_id, collect_time, seq, run_depth, run_current, run_water_press,
+               run_weight_add, run_state, type, create_ts
+        FROM crushed_stone_pile_cold
+        WHERE collect_time &gt;= #{start} AND collect_time &lt;= #{end}
+        ORDER BY collect_time DESC
+    </select>
+
+    <select id="selectColdById" resultType="com.lhh.pojo.CrushedStonePile">
+        SELECT id, device_id, collect_time, seq, run_depth, run_current, run_water_press,
+               run_weight_add, run_state, type, create_ts
+        FROM crushed_stone_pile_cold
+        WHERE id = #{id}
+    </select>
+</mapper>

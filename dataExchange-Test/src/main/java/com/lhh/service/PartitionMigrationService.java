@@ -8,6 +8,7 @@ import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -51,54 +52,52 @@ public class PartitionMigrationService {
      * @return true=搬迁成功，false=失败（已回滚，源数据仍在热表）
      */
     @Transactional(rollbackFor = Exception.class)
-    public boolean moveToCold(String partitionName) {
-        String hotTable = hotColdConfig.getTableName();
-        String coldTable = hotColdConfig.getColdTableName();
+    public boolean moveToCold(String hotTable, String coldTable, String partitionName) {
 
-        // ① 迁移前统计源（热表）分区行数，作为「应搬运行数」基准
-        int srcCount = partitionVisitMapper.countRowsInPartition(hotTable, partitionName);
-        if (srcCount == 0) {
-            log.info("热表分区 {} 无数据，跳过迁冷", partitionName);
-            return false;
+            // ① 迁移前统计源（热表）分区行数，作为「应搬运行数」基准
+            int srcCount = partitionVisitMapper.countRowsInPartition(hotTable, partitionName);
+            if (srcCount == 0) {
+                log.info("热表分区 {} 无数据，跳过迁冷", partitionName);
+                return false;
+            }
+
+            // ② 复制热表该分区数据到冷表
+            Map<String, Object> copyParam = new HashMap<>();
+            copyParam.put("hotTableName", hotTable);
+            copyParam.put("coldTableName", coldTable);
+            copyParam.put("partitionName", partitionName);
+            partitionVisitMapper.copyHotToCold(copyParam);
+
+            // ③ 行数守恒校验（复制侧）：冷表镜像分区迁移前应为空，复制后必须恰好持有 srcCount 行。
+            //    若不等于 srcCount，说明 INSERT IGNORE 静默丢弃了行（列错位/语法不支持/约束失败）
+            //    或目标分区存在非预期残留，此时绝不能删源数据，抛异常整体回滚，避免丢数。
+            int dstCount = partitionVisitMapper.countRowsInPartition(coldTable, partitionName);
+            if (dstCount != srcCount) {
+                throw new IllegalStateException(String.format(
+                        "迁冷复制校验失败：热表分区 %s 应搬运 %d 行，冷表实际 %d 行（疑似 INSERT IGNORE 静默丢行），回滚",
+                        partitionName, srcCount, dstCount));
+            }
+
+            // ④ 删除热表该分区的行数据（保留空分区），删除数必须等于源行数，否则视为并发修改，回滚
+            Map<String, Object> delParam = new HashMap<>();
+            delParam.put("tableName", hotTable);
+            delParam.put("partitionName", partitionName);
+            int deleted = partitionVisitMapper.deleteRowsFromPartition(delParam);
+            if (deleted != srcCount) {
+                throw new IllegalStateException(String.format(
+                        "迁冷删除校验失败：热表分区 %s 预期删除 %d 行，实际删除 %d 行（源数据被并发修改），回滚",
+                        partitionName, srcCount, deleted));
+            }
+
+            // ⑤ 登记冷表该分区的迁移时间并清零访问量（upsert 到目标表，冷却期跨表生效）
+            Map<String, Object> movedParam = new HashMap<>();
+            movedParam.put("tableName", coldTable);
+            movedParam.put("partitionName", partitionName);
+            partitionVisitMapper.updateLastMovedTime(movedParam);
+
+            log.info("分区 {} 数据已从热表 {} 搬到冷表 {}，搬运行数={}（行数校验通过）", partitionName, hotTable, coldTable, srcCount);
+            return true;
         }
-
-        // ② 复制热表该分区数据到冷表
-        Map<String, Object> copyParam = new HashMap<>();
-        copyParam.put("hotTableName", hotTable);
-        copyParam.put("coldTableName", coldTable);
-        copyParam.put("partitionName", partitionName);
-        partitionVisitMapper.copyHotToCold(copyParam);
-
-        // ③ 行数守恒校验（复制侧）：冷表镜像分区迁移前应为空，复制后必须恰好持有 srcCount 行。
-        //    若不等于 srcCount，说明 INSERT IGNORE 静默丢弃了行（列错位/语法不支持/约束失败）
-        //    或目标分区存在非预期残留，此时绝不能删源数据，抛异常整体回滚，避免丢数。
-        int dstCount = partitionVisitMapper.countRowsInPartition(coldTable, partitionName);
-        if (dstCount != srcCount) {
-            throw new IllegalStateException(String.format(
-                    "迁冷复制校验失败：热表分区 %s 应搬运 %d 行，冷表实际 %d 行（疑似 INSERT IGNORE 静默丢行），回滚",
-                    partitionName, srcCount, dstCount));
-        }
-
-        // ④ 删除热表该分区的行数据（保留空分区），删除数必须等于源行数，否则视为并发修改，回滚
-        Map<String, Object> delParam = new HashMap<>();
-        delParam.put("tableName", hotTable);
-        delParam.put("partitionName", partitionName);
-        int deleted = partitionVisitMapper.deleteRowsFromPartition(delParam);
-        if (deleted != srcCount) {
-            throw new IllegalStateException(String.format(
-                    "迁冷删除校验失败：热表分区 %s 预期删除 %d 行，实际删除 %d 行（源数据被并发修改），回滚",
-                    partitionName, srcCount, deleted));
-        }
-
-        // ⑤ 登记冷表该分区的迁移时间并清零访问量（upsert 到目标表，冷却期跨表生效）
-        Map<String, Object> movedParam = new HashMap<>();
-        movedParam.put("tableName", coldTable);
-        movedParam.put("partitionName", partitionName);
-        partitionVisitMapper.updateLastMovedTime(movedParam);
-
-        log.info("分区 {} 数据已从热表 {} 搬到冷表 {}，搬运行数={}（行数校验通过）", partitionName, hotTable, coldTable, srcCount);
-        return true;
-    }
 
     /**
      * 冷→热：把冷表指定分区的数据搬回热表（原子操作）
@@ -107,57 +106,57 @@ public class PartitionMigrationService {
      * @return true=搬迁成功，false=失败（已回滚，源数据仍在冷表）
      */
     @Transactional(rollbackFor = Exception.class)
-    public boolean moveToHot(String partitionName) {
-        String hotTable = hotColdConfig.getTableName();
-        String coldTable = hotColdConfig.getColdTableName();
+    public boolean moveToHot(String hotTable, String coldTable, String partitionName) {
 
-        // 前置校验：目标热表分区必须存在（对称分区应始终成立，防御性检查）
-        if (partitionVisitMapper.countPartition(hotTable, partitionName) == 0) {
-            log.warn("热表缺少分区 {}，无法安全迁回（历史中间分区不可 ADD），跳过", partitionName);
-            return false;
+
+            // 前置校验：目标热表分区必须存在（对称分区应始终成立，防御性检查）
+            if (partitionVisitMapper.countPartition(hotTable, partitionName) == 0) {
+                log.warn("热表缺少分区 {}，无法安全迁回（历史中间分区不可 ADD），跳过", partitionName);
+                return false;
+            }
+
+            // ① 迁移前统计源（冷表）分区行数，作为「应搬运行数」基准
+            int srcCount = partitionVisitMapper.countRowsInPartition(coldTable, partitionName);
+            if (srcCount == 0) {
+                log.info("冷表分区 {} 无数据，跳过迁热", partitionName);
+                return false;
+            }
+
+            // ② 复制冷表该分区数据到热表
+            Map<String, Object> copyParam = new HashMap<>();
+            copyParam.put("hotTableName", hotTable);
+            copyParam.put("coldTableName", coldTable);
+            copyParam.put("partitionName", partitionName);
+            partitionVisitMapper.copyColdToHot(copyParam);
+
+            // ③ 行数守恒校验（复制侧）：热表镜像分区迁移前应为空，复制后必须恰好持有 srcCount 行。
+            //    若不等于 srcCount，说明 INSERT IGNORE 静默丢弃了行或目标分区有非预期残留，抛异常回滚。
+            int dstCount = partitionVisitMapper.countRowsInPartition(hotTable, partitionName);
+            if (dstCount != srcCount) {
+                throw new IllegalStateException(String.format(
+                        "迁热复制校验失败：冷表分区 %s 应搬运 %d 行，热表实际 %d 行（疑似 INSERT IGNORE 静默丢行），回滚",
+                        partitionName, srcCount, dstCount));
+            }
+
+            // ④ 删除冷表该分区的行数据（保留空分区），删除数必须等于源行数，否则视为并发修改，回滚
+            Map<String, Object> delParam = new HashMap<>();
+            delParam.put("tableName", coldTable);
+            delParam.put("partitionName", partitionName);
+            int deleted = partitionVisitMapper.deleteRowsFromPartition(delParam);
+            if (deleted != srcCount) {
+                throw new IllegalStateException(String.format(
+                        "迁热删除校验失败：冷表分区 %s 预期删除 %d 行，实际删除 %d 行（源数据被并发修改），回滚",
+                        partitionName, srcCount, deleted));
+            }
+
+            // ⑤ 登记热表该分区的迁移时间并清零访问量（upsert 到目标表，冷却期跨表生效）
+            Map<String, Object> movedParam = new HashMap<>();
+            movedParam.put("tableName", hotTable);
+            movedParam.put("partitionName", partitionName);
+            partitionVisitMapper.updateLastMovedTime(movedParam);
+
+            log.info("分区 {} 数据已从冷表 {} 搬回热表 {}，搬运行数={}（行数校验通过）", partitionName, coldTable, hotTable, srcCount);
+            return true;
         }
 
-        // ① 迁移前统计源（冷表）分区行数，作为「应搬运行数」基准
-        int srcCount = partitionVisitMapper.countRowsInPartition(coldTable, partitionName);
-        if (srcCount == 0) {
-            log.info("冷表分区 {} 无数据，跳过迁热", partitionName);
-            return false;
-        }
-
-        // ② 复制冷表该分区数据到热表
-        Map<String, Object> copyParam = new HashMap<>();
-        copyParam.put("hotTableName", hotTable);
-        copyParam.put("coldTableName", coldTable);
-        copyParam.put("partitionName", partitionName);
-        partitionVisitMapper.copyColdToHot(copyParam);
-
-        // ③ 行数守恒校验（复制侧）：热表镜像分区迁移前应为空，复制后必须恰好持有 srcCount 行。
-        //    若不等于 srcCount，说明 INSERT IGNORE 静默丢弃了行或目标分区有非预期残留，抛异常回滚。
-        int dstCount = partitionVisitMapper.countRowsInPartition(hotTable, partitionName);
-        if (dstCount != srcCount) {
-            throw new IllegalStateException(String.format(
-                    "迁热复制校验失败：冷表分区 %s 应搬运 %d 行，热表实际 %d 行（疑似 INSERT IGNORE 静默丢行），回滚",
-                    partitionName, srcCount, dstCount));
-        }
-
-        // ④ 删除冷表该分区的行数据（保留空分区），删除数必须等于源行数，否则视为并发修改，回滚
-        Map<String, Object> delParam = new HashMap<>();
-        delParam.put("tableName", coldTable);
-        delParam.put("partitionName", partitionName);
-        int deleted = partitionVisitMapper.deleteRowsFromPartition(delParam);
-        if (deleted != srcCount) {
-            throw new IllegalStateException(String.format(
-                    "迁热删除校验失败：冷表分区 %s 预期删除 %d 行，实际删除 %d 行（源数据被并发修改），回滚",
-                    partitionName, srcCount, deleted));
-        }
-
-        // ⑤ 登记热表该分区的迁移时间并清零访问量（upsert 到目标表，冷却期跨表生效）
-        Map<String, Object> movedParam = new HashMap<>();
-        movedParam.put("tableName", hotTable);
-        movedParam.put("partitionName", partitionName);
-        partitionVisitMapper.updateLastMovedTime(movedParam);
-
-        log.info("分区 {} 数据已从冷表 {} 搬回热表 {}，搬运行数={}（行数校验通过）", partitionName, coldTable, hotTable, srcCount);
-        return true;
-    }
 }
